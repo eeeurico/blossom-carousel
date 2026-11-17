@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { dragSnap, restInLoop, shouldSnap, snapSelect } from "../src/snap";
+import { dragSnap, shouldSnap, snapSelect } from "../src/snap";
 import { next, prev } from "../src/methods";
 import { createState } from "../src/state";
 import { FRICTION } from "../src/constants";
@@ -75,15 +75,26 @@ describe("snapping with repeat", () => {
     expect(shouldSnap(150, 0, FRICTION, state)).toBe(false); // 200 away
   });
 
-  it("keeps a rest out of the band around the seam", () => {
+  it.each([1, -1] as const)(
+    "leaves a rest exactly on a loop boundary alone (dir %i)",
+    (dir) => {
+      const state = loop(dir);
+      // the slides' start and end snap positions lie on the boundary
+      state.snapPositions.forEach((position, i) => (position.x = i * 100 * dir));
+
+      expect(snapSelect(2 * dir, 0, FRICTION, state).x + 0).toBe(0);
+      expect(snapSelect(402 * dir, 0, FRICTION, state).x).toBe(400 * dir);
+      expect(snapSelect(-398 * dir, 0, FRICTION, state).x).toBe(-400 * dir);
+      expect(snapSelect(-2 * dir, 0, FRICTION, state).x + 0).toBe(0);
+    },
+  );
+
+  it("takes positions many loops out as they are", () => {
     const state = loop();
 
-    expect(restInLoop(150, state)).toBe(150);
-    expect(restInLoop(2, state)).toBe(4);
-    expect(restInLoop(399, state)).toBe(396);
-    expect(restInLoop(802, state)).toBe(804);
-    expect(restInLoop(-150, loop(-1))).toBe(-150);
-    expect(restInLoop(-2, loop(-1))).toBe(-4);
+    const far = snapSelect(500000 + 140, 0, FRICTION, state);
+    expect(far.target).toBe(state.snapPositions[1].target);
+    expect(far.x).toBe(500000 + 150);
   });
 });
 
@@ -114,5 +125,69 @@ describe("next and prev in RTL", () => {
 
     next(state);
     expect(to()).toBe(-450);
+  });
+});
+
+describe.each([1, -1] as const)("next and prev in the middle of the range (dir %i)", (dir) => {
+  const HOME = 500000; // a whole number of periods
+  function scrollTarget(state: ReturnType<typeof loop>, left: number) {
+    let to: number | undefined;
+    Object.defineProperty(state.scroller, "scrollLeft", { value: left * dir });
+    state.scroller!.scrollTo = ((options: ScrollToOptions) => {
+      to = options.left;
+    }) as typeof state.scroller.scrollTo;
+    return () => to;
+  }
+
+  it.each([
+    // [at, next, prev]: positions at 50, 150, 250, 350 round every loop
+    [150, 250, 50],
+    [350, 450, 250], // the first slide again, a loop on
+    [50, 150, -50], // the last slide, a loop back
+    [60, 150, 50],
+  ])("from HOME + %i go to HOME + %i and HOME + %i", (at, forward, back) => {
+    const state = loop(dir);
+    const to = scrollTarget(state, HOME + at);
+
+    next(state);
+    expect(to()).toBe((HOME + forward) * dir);
+    prev(state);
+    expect(to()).toBe((HOME + back) * dir);
+  });
+});
+
+describe.each([1, -1] as const)("next and prev around the lead (dir %i)", (dir) => {
+  // the ::before pushes the slides LEAD in: their natural snap positions are
+  // there, and the scroll may be any number of loops either side of them
+  const LEAD = 500000;
+  function natural() {
+    const state = loop(dir);
+    state.snapPositions.forEach((position, i) => (position.x = (LEAD + 150 + i * 100) * dir));
+    return state;
+  }
+  function scrollTarget(state: ReturnType<typeof loop>, left: number) {
+    let to: number | undefined;
+    Object.defineProperty(state.scroller, "scrollLeft", { value: left * dir });
+    state.scroller!.scrollTo = ((options: ScrollToOptions) => {
+      to = options.left;
+    }) as typeof state.scroller.scrollTo;
+    return () => to;
+  }
+
+  it.each([
+    // [at, next, prev]: positions at 150, 250, 350, 450 round every loop
+    [-200, -150, -250], // a loop before the slides
+    [150, 250, 50], // on the first: the last one a loop back
+    [150.5, 250, 50], // within a pixel of it
+    [450, 550, 350], // on the last: the first one a loop on
+    [1000, 1050, 950], // loops on
+  ])("from LEAD + %d go to LEAD + %d and LEAD + %d", (at, forward, back) => {
+    const state = natural();
+    const to = scrollTarget(state, LEAD + at);
+
+    next(state);
+    expect(to()).toBe((LEAD + forward) * dir);
+    prev(state);
+    expect(to()).toBe((LEAD + back) * dir);
   });
 });

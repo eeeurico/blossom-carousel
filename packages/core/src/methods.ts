@@ -46,27 +46,28 @@ function findTargetPosition(
     ? state.snapPositions
     : state.slidePositions;
 
-  // repeat: past the last position comes the first one again, one loop on
-  const loops = state.period ? [0, state.period] : [0];
-
-  for (const loop of loops) {
-    if (dir === "prev") {
-      for (let i = positions.length - 1; i >= 0; i--) {
-        const posX =
-          alignedPosition(positions[i].x, positions[i].width || 0, align, state) *
-            sign -
-          loop;
-        if (posX < left - 1) return posX * sign;
-      }
-    } else {
-      for (let i = 0; i < positions.length; i++) {
-        const posX =
-          alignedPosition(positions[i].x, positions[i].width || 0, align, state) *
-            sign +
-          loop;
-        if (posX > left + 1) return posX * sign;
-      }
+  const aligned = positions.map(
+    (position) => alignedPosition(position.x, position.width || 0, align, state) * sign,
+  );
+  const { period } = state;
+  if (period) {
+    // repeat: every position comes round again each loop, take the first
+    // occurrence beyond where the scroll is
+    let best: number | null = null;
+    for (const x of aligned) {
+      const posX =
+        dir === "prev"
+          ? x + period * Math.ceil((left - 1 - x) / period - 1)
+          : x + period * Math.floor((left + 1 - x) / period + 1);
+      if (best === null || (dir === "prev" ? posX > best : posX < best)) best = posX;
     }
+    return best === null ? null : best * sign;
+  }
+  if (dir === "prev") {
+    for (let i = aligned.length - 1; i >= 0; i--)
+      if (aligned[i] < left - 1) return aligned[i] * sign;
+  } else {
+    for (const x of aligned) if (x > left + 1) return x * sign;
   }
   return null;
 }

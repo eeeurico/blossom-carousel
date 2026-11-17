@@ -17,7 +17,6 @@ import {
   dragSnap,
   shouldSnap,
   snapSelect,
-  restInLoop,
 } from "./snap";
 import { prev, next } from "./methods";
 
@@ -114,6 +113,9 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
   let links: NodeListOf<HTMLAnchorElement> | null = null;
   let resizeObserver: ResizeObserver | null = null;
   let mutationObserver: MutationObserver | null = null;
+  let roomObserver: MutationObserver | null = null;
+  /** the scroller's own scrollLeft property, if it had one before repeat's */
+  let ownScrollLeft: PropertyDescriptor | undefined;
   let restoreScrollMethods: () => void;
   let styleObserver: StyleObserver | null = null;
   let hasTouch = false;
@@ -135,6 +137,49 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
     }
     scroller.scrollTo = scrollToOverride;
     scroller.scrollBy = scrollByOverride;
+    if (options?.repeat) {
+      scroller.scroll = scrollToOverride;
+      // scrollLeft = x is a scroll like scrollTo: round the loop
+      ownScrollLeft = Object.getOwnPropertyDescriptor(scroller, "scrollLeft");
+      let owner: object | null = scroller;
+      let found = ownScrollLeft;
+      while (!found && (owner = Object.getPrototypeOf(owner)))
+        found = Object.getOwnPropertyDescriptor(owner, "scrollLeft");
+      const { get, set } = found || {};
+      if (get && set && ownScrollLeft?.configurable !== false) {
+        Object.defineProperty(scroller, "scrollLeft", {
+          configurable: true,
+          get: () => get.call(scroller),
+          set: (left: number) => {
+            if (!state.period) return set.call(scroller, left);
+            scroller.scrollTo({ left });
+          },
+        });
+      }
+      // a framework may write the style attribute over the room and the
+      // slides' places: put them back before the browser lays out
+      roomObserver = new MutationObserver((records) => {
+        if (!state.period) return;
+        const { style } = scroller;
+        if (
+          records.some(({ target }) => target === scroller) &&
+          !style.getPropertyValue("--blossom-repeat-lead")
+        ) {
+          const period = state.period;
+          const kept = lead;
+          lead = 0;
+          positioned = false;
+          setRoom(period, kept - ROOM);
+        }
+        if (records.some(({ target }) => target.parentNode === scroller))
+          onRepeat(null, null);
+      });
+      roomObserver.observe(scroller, {
+        attributes: true,
+        attributeFilter: ["style"],
+        subtree: true,
+      });
+    }
 
     resizeObserver = new ResizeObserver((entries = []) =>
       onResize(
@@ -204,9 +249,18 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
       isTicking.value = false;
       return repeatScrollIntoView(target, arg);
     });
+
+    // repeat: on the first slide from the first frame on
+    if (looping) onResize();
   }
 
   function destroy() {
+    // repeat: how far past the first slide's start the scroll is, in the loop
+    const into = state.period
+      ? ((((scroller.scrollLeft * state.dir - loopStart) % state.period) +
+          state.period) %
+          state.period)
+      : null;
     scroller.removeAttribute("blossom-carousel");
     resizeObserver?.disconnect();
     mutationObserver?.disconnect();
@@ -234,7 +288,20 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
     if (options?.repeat) {
       // leave nothing of the loop behind: the attribute switches native
       // snapping off and tells navigation to loop
+      const { dir } = state;
       scroller.removeAttribute("has-repeat");
+      roomObserver?.disconnect();
+      delete (scroller as any).scroll;
+      if (ownScrollLeft) Object.defineProperty(scroller, "scrollLeft", ownScrollLeft);
+      else delete (scroller as any).scrollLeft;
+      ownScrollLeft = undefined;
+      setRoom(0);
+      // out of the long scroll range, to the same slides
+      if (into !== null) {
+        const pad =
+          parseFloat(window.getComputedStyle(scroller).paddingInlineStart) || 0;
+        scrollTo({ left: (into + pad) * dir, behavior: "instant" as ScrollBehavior });
+      }
       setSeamGap(false);
       for (const slide of Array.from(scroller.children) as HTMLElement[]) {
         slide.style.translate = "";
@@ -307,7 +374,61 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
         }
       }
       setSeamGap(looping);
+      setRoom(looping ? loopLength() : 0);
     }
+    measure();
+    if (looping) {
+      if (!hasStartPosition && state.period > 0) {
+        hasStartPosition = true;
+        // a carousel that couldn't loop at first keeps where it was taken to
+        if (ranUnlooped && anchor && anchor.left) restoreRepeatAnchor(anchor, 0, true);
+        else scrollToRepeatStart();
+        // like native snapping, the start is snapped to without any event
+        if (state.hasSnap && state.snapPositions.length) {
+          state.activeSnapPosition = snapSelect(scroller.scrollLeft, 0, FRICTION, state);
+          snappedTo = state.activeSnapPosition.target;
+        }
+      } else if (anchor) {
+        // what was aligned stays where it is: the scroll is left alone (a
+        // touch scroll doesn't survive being moved), the slides are moved
+        // under it by the room before them
+        // (under a scroll a slide that changes size, the active one growing,
+        // say, isn't held on to: the content at the start edge is)
+        const shift = restoreRepeatAnchor(
+          anchor,
+          oldPeriod,
+          false,
+          slidesOnly && scrolling(),
+        );
+        if (Math.abs(shift) > 0.01) {
+          setRoom(state.period, shift);
+          measure();
+        }
+      }
+      if (isTicking.value && !state.isDragging && state.snapPositions.length) {
+        // the snap position a glide was heading for moved with the slides
+        if (animating) {
+          destination = snapSelect(destination, 0, FRICTION, state).x;
+          velocity.x = ((destination - target.x) * (1 - FRICTION)) / FRICTION;
+        } else if (shouldSnap(target.x, velocity.x, FRICTION, state)) {
+          velocity.x = dragSnap(target.x, velocity.x, FRICTION, state);
+        }
+      }
+      onRepeat(null, null);
+      lastAnchor = state.period ? repeatAnchor() : null;
+      // a resize or a dom change is no scroll of its own
+      if (!scrolling()) restLeft = scroller.scrollLeft;
+      settleSoon(true);
+    } else {
+      ranUnlooped = true;
+      if (wasLooping && anchor) {
+        lastAnchor = null;
+        restoreRepeatAnchor(anchor, oldPeriod);
+      }
+    }
+  }
+
+  function measure(): void {
     state.scrollerScrollWidth = scroller.scrollWidth;
     state.scrollerWidth = scroller.clientWidth;
     state.scrollerScrollHeight = scroller.scrollHeight;
@@ -329,9 +450,7 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
     state.dir = isRTL(scroller) ? -1 : 1;
     state.end =
       (state.scrollerScrollWidth - state.scrollerWidth - 4) * state.dir;
-    state.period = looping
-      ? state.scrollerScrollWidth - state.scrollerWidth
-      : 0;
+    state.period = looping ? loopLength() : 0;
 
     if (state.hasSnap) {
       findSnapPositions(scroller, state);
@@ -349,43 +468,7 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
         };
       });
     }
-    if (looping) {
-      measureLoop();
-      if (!hasStartPosition && state.period > 0) {
-        hasStartPosition = true;
-        // a carousel that couldn't loop at first keeps where it was taken to
-        if (ranUnlooped && anchor && anchor.left) restoreRepeatAnchor(anchor, 0);
-        else scrollToRepeatStart();
-        // like native snapping, the start is snapped to without any event
-        if (state.hasSnap && state.snapPositions.length) {
-          state.activeSnapPosition = snapSelect(scroller.scrollLeft, 0, FRICTION, state);
-          snappedTo = state.activeSnapPosition.target;
-        }
-      } else if (anchor && !(slidesOnly && scrolling())) {
-        // a slide that changes size under a scroll (the active one growing,
-        // say) must not pull the scroll back
-        restoreRepeatAnchor(anchor, oldPeriod);
-      } else if (isTicking.value && !state.isDragging && state.snapPositions.length) {
-        // the snap position a glide was heading for moved with the slides
-        if (animating) {
-          destination = restInLoop(snapSelect(destination, 0, FRICTION, state).x, state);
-          velocity.x = ((destination - target.x) * (1 - FRICTION)) / FRICTION;
-        } else if (shouldSnap(target.x, velocity.x, FRICTION, state)) {
-          velocity.x = dragSnap(target.x, velocity.x, FRICTION, state);
-        }
-      }
-      onRepeat(null, null);
-      lastAnchor = state.period ? repeatAnchor() : null;
-      // a resize or a dom change is no scroll of its own
-      if (!scrolling()) restLeft = scroller.scrollLeft;
-      settleSoon(true);
-    } else {
-      ranUnlooped = true;
-      if (wasLooping && anchor) {
-        lastAnchor = null;
-        restoreRepeatAnchor(anchor, oldPeriod);
-      }
-    }
+    if (looping) measureLoop();
   }
 
   // The loop joins the last slide to the first, but a flex or grid gap only
@@ -411,11 +494,17 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
     seamSlide = last;
     seamMargin = last.style.marginInlineEnd;
     const margin = parseFloat(window.getComputedStyle(last).marginInlineEnd) || 0;
-    const width = scroller.scrollWidth;
+    const length = loopLength();
+    const width = last.getBoundingClientRect().width;
     last.style.marginInlineEnd = `${margin + gap}px`;
     seamLent = last.style.marginInlineEnd;
-    // a fixed grid track, or a last child out of the flow, doesn't grow the range
-    if (scroller.scrollWidth - width < gap - 0.5) setSeamGap(false);
+    // a fixed grid track squeezes the slide, a last child out of the flow
+    // doesn't count
+    if (
+      loopLength() - length < gap - 0.5 ||
+      Math.abs(last.getBoundingClientRect().width - width) > 0.5
+    )
+      setSeamGap(false);
   }
 
   /** repeat: whether the slides are looped right now (see canLoop) */
@@ -450,9 +539,13 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
     // the padding can widen the scroller, and leaves percentage-wide slides
     // nothing to be wide in: then it doesn't loop after all
     unfit = slideWidths().some((width, i) => width < widths[i] - 0.5);
-    if (!unfit && fits()) return;
+    setRoom(loopLength());
+    // nor without the room before the slides, which a grid with a template of
+    // its own doesn't give
+    if (!unfit && fits() && firstStart() >= lead / 2) return;
     looping = false;
     unloopable = tried;
+    setRoom(0);
     scroller.setAttribute("has-repeat", "false");
     if (scroller.scrollLeft === left) return;
     __scrollingInternally = true;
@@ -469,15 +562,82 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
   const slideWidths = () =>
     Array.from(scroller.children, (slide) => slide.getBoundingClientRect().width);
   function fits(): boolean {
-    const styles = window.getComputedStyle(scroller);
-    const length =
-      scroller.scrollWidth -
-      (parseFloat(styles.paddingInlineStart) || 0) -
-      (parseFloat(styles.paddingInlineEnd) || 0);
-    return length - scroller.clientWidth >= Math.max(0, ...slideWidths()) - 0.5;
+    return loopLength() - scroller.clientWidth >= Math.max(0, ...slideWidths()) - 0.5;
   }
+  /** the length of one loop: the slides from end to end, margins and all,
+   *  measured with every slide in its natural position */
+  function loopLength(): number {
+    let start = Infinity;
+    let end = -Infinity;
+    for (const slide of Array.from(scroller.children)) {
+      const { left, right, width } = slide.getBoundingClientRect();
+      if (!width && !slide.getClientRects().length) continue;
+      const styles = window.getComputedStyle(slide);
+      start = Math.min(start, left - (parseFloat(styles.marginLeft) || 0));
+      end = Math.max(end, right + (parseFloat(styles.marginRight) || 0));
+    }
+    return end > start ? end - start : 0;
+  }
+
+  // The scroll range is many loops long, with the slides in the middle of it:
+  // there is room before them (::before, in the flow) and beyond them (::after
+  // marks the end, see style.css). So a scroll never has to be moved while it
+  // is under way, which touch scrolling doesn't survive: a loop on, the slides
+  // are shown there (onRepeat), and only at rest is the scroll put back among
+  // the slides' own positions.
+  const ROOM = 500000;
+  let lead = 0;
+  function setRoom(period: number, shift = 0): void {
+    const { style } = scroller;
+    if (!period) {
+      lead = 0;
+      style.removeProperty("--blossom-repeat-lead");
+      style.removeProperty("--blossom-repeat-reach");
+      if (positioned) style.removeProperty("position");
+      positioned = false;
+      return;
+    }
+    lead = (lead || ROOM) + shift;
+    // a whole loop more or less shows the same: keep it about where it was
+    if (Math.abs(lead - ROOM) > ROOM / 2)
+      lead -= period * Math.round((lead - ROOM) / period);
+    style.setProperty("--blossom-repeat-lead", `${lead}px`);
+    style.setProperty(
+      "--blossom-repeat-reach",
+      `${lead + period + ROOM + scroller.clientWidth}px`,
+    );
+    // ::after needs the scroller for its containing block
+    if (!positioned && window.getComputedStyle(scroller).position === "static") {
+      positioned = true;
+      style.setProperty("position", "relative");
+    }
+  }
+  /** position: relative was set here, over a rule that made it static */
+  let positioned = false;
+  /** the first slide's natural start, logical */
+  function firstStart(): number {
+    const rtl = isRTL(scroller);
+    const rect = scroller.getBoundingClientRect();
+    let start = Infinity;
+    for (const slide of Array.from(scroller.children)) {
+      const { left, right, width } = slide.getBoundingClientRect();
+      // one without a box
+      if (!width && !slide.getClientRects().length) continue;
+      start = Math.min(start, rtl ? rect.right - right : left - rect.left);
+    }
+    return start - scroller.clientLeft + scroller.scrollLeft * (rtl ? -1 : 1);
+  }
+  /** where the slides start, in their natural positions */
+  let loopStart = 0;
+  /** how many loops on from the slides' natural positions x (logical) is */
+  const loopOf = (x: number) =>
+    Math.floor((x + state.scrollerWidth / 2 - loopStart) / state.period);
+  /** x brought back among the slides' natural positions */
+  const homed = (x: number) => x - state.period * loopOf(x);
+  /** the scroll has come too near an end of the scroll range */
+  const astray = (x: number) => x < state.period || x > lead + ROOM;
   /** repeat: each slide's natural logical extent, in scroll coordinates */
-  let loopSlides: Array<{ start: number; end: number }> = [];
+  let loopSlides: Array<{ start: number; end: number; shift?: number; css?: string }> = [];
   function measureLoop(): void {
     const scrollerRect = scroller.getBoundingClientRect();
     const border =
@@ -492,12 +652,23 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
         scroller.scrollLeft * state.dir;
       return { start, end: start + rect.width };
     });
+    loopStart = Math.min(
+      ...loopSlides.filter(({ start, end }) => end > start).map(({ start }) => start),
+      Infinity,
+    );
+    if (!Number.isFinite(loopStart)) loopStart = 0;
   }
 
   // The padding of a repeating scroller follows its width, so a resize moves
   // everything by half the change. Hold on to what was aligned: the nearest
   // snap target, or without snapping the content at the start edge.
-  type RepeatAnchor = { target: HTMLElement | null; offset: number; left: number };
+  type RepeatAnchor = {
+    target: HTMLElement | null;
+    offset: number;
+    left: number;
+    /** how far into the loop the scroll is, from where the slides start */
+    into: number;
+  };
   let lastAnchor: RepeatAnchor | null = null;
   // where restoreRepeatAnchor meant to scroll to: scrollLeft rounds a
   // fractional position (odd widths halve into the padding), and anchoring
@@ -508,18 +679,31 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
     if (restoredLeft !== null && Math.abs(left - restoredLeft) < 1)
       left = restoredLeft;
     else restoredLeft = null;
+    // whichever loop of the scroll range it is
+    const { period } = state;
+    const into = period
+      ? ((((left * state.dir - loopStart) % period) + period) % period) * state.dir
+      : left - state.padding.start * state.dir;
     if (state.hasSnap && state.snapPositions.length) {
       const nearest = snapSelect(left, 0, FRICTION, state);
-      return { target: nearest.target, offset: left - nearest.x, left };
+      return { target: nearest.target, offset: left - nearest.x, left, into };
     }
-    return { target: null, offset: left - state.padding.start * state.dir, left };
+    return { target: null, offset: into, left, into };
   }
 
-  function restoreRepeatAnchor(anchor: RepeatAnchor, oldPeriod: number): void {
+  /** Returns how far the slides have to be moved to bring the anchor back
+   *  under the scroll; with jump (or when no longer looping) scrolls to it. */
+  function restoreRepeatAnchor(
+    anchor: RepeatAnchor,
+    oldPeriod: number,
+    jump = false,
+    loose = false,
+  ): number {
+    if (loose) anchor = { ...anchor, target: null, offset: anchor.into };
     const base = anchor.target
       ? state.snapPositions.find(({ target }) => target === anchor.target)?.x
-      : state.padding.start * state.dir;
-    if (base === undefined) return;
+      : (state.period ? loopStart : state.padding.start) * state.dir;
+    if (base === undefined) return 0;
 
     if (!state.period) {
       // no longer looping: the same content at the start edge, within range
@@ -528,32 +712,31 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
         offset = ((offset % oldPeriod) + oldPeriod) % oldPeriod;
       const max = Math.max(state.scrollerScrollWidth - state.scrollerWidth, 0);
       const left = clamp(base * state.dir + offset, 0, max) * state.dir;
-      if (Math.abs(left - scroller.scrollLeft) < 0.5) return;
+      if (Math.abs(left - scroller.scrollLeft) < 0.5) return 0;
       __scrollingInternally = true;
       scroller.scrollTo({ left, behavior: "instant" as ScrollBehavior });
-      return;
+      return 0;
     }
 
-    const pos =
-      ((((base + anchor.offset) * state.dir) % state.period) + state.period) %
-      state.period;
-    const left = restInLoop(pos * state.dir, state);
-    // the ticker's own position moves along
-    const shift = left - anchor.left;
-    virtualScroll.x += shift;
-    target.x += shift;
-    destination += shift;
-
-    restoredLeft = left;
-    if (Math.abs(left - scroller.scrollLeft) < 0.5) return;
-    __scrollingInternally = true;
-    scroller.scrollTo({ left, behavior: "instant" as ScrollBehavior });
+    let pos = (base + anchor.offset) * state.dir;
+    if (jump) {
+      restoredLeft = pos * state.dir;
+      __scrollingInternally = true;
+      scroller.scrollTo({ left: restoredLeft, behavior: "instant" as ScrollBehavior });
+      return 0;
+    }
+    // the copy of it nearest to where it was
+    const now = anchor.left * state.dir;
+    pos += state.period * Math.round((now - pos) / state.period);
+    return now - pos;
   }
 
   // A repeating scroller is padded by half its width on both sides, so
   // scrollLeft 0 shows the first slide in the middle. Start where a carousel
   // without repeat starts: on the first slide, at its own snap alignment.
   let hasStartPosition = false;
+  /** the start position, from where the slides start */
+  let startOffset = 0;
   function scrollToRepeatStart(): void {
     const first = scroller.firstElementChild as HTMLElement | null;
     if (!first) return;
@@ -574,10 +757,10 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
     if (align === "end")
       x = start + rect.width - state.scrollerWidth + state.scrollPadding.end;
 
-    x = ((x % state.period) + state.period) % state.period;
+    startOffset = x - loopStart;
     __scrollingInternally = true;
     scroller.scrollTo({
-      left: Math.min(Math.max(x, 4), state.end * state.dir) * state.dir,
+      left: x * state.dir,
       behavior: "instant" as ScrollBehavior,
     });
   }
@@ -753,7 +936,7 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
     settleSoon();
   }
 
-  // repeat switches native snapping off (it fights the wrap, see style.css),
+  // repeat switches native snapping off (see style.css),
   // so a scroll that core didn't run itself (wheel, keys, touch, an instant
   // or interrupted programmatic scroll) is snapped here once it has come to rest
   let settleTimer = 0;
@@ -778,7 +961,8 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
     if (!shouldSnap(left, 0, FRICTION, state)) return rest(false);
 
     let { x } = snapSelect(left, 0, FRICTION, state);
-    if (Math.abs(restInLoop(x, state) - left) < 1) {
+    // (the move back to the slides' own positions rounds anew)
+    if (Math.abs(x - left) < (settleResized ? 2 : 1)) {
       restedAt = left;
       stepping = false;
       return rest(true);
@@ -805,7 +989,7 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
   }
 
   // the browser's scrollend is no use under repeat: it fires for every ticker
-  // frame, wrap and teleport, before core has snapped. swallow it and announce
+  // frame and before core has snapped. swallow it and announce
   // the rest once, like native snapping: snap events first, then scrollend
   /** where the last announced rest was */
   let restLeft = 0;
@@ -823,6 +1007,17 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
   }
 
   function rest(snapped: boolean): void {
+    // loops on from the slides' own positions: back among them, unseen
+    const pos = scroller.scrollLeft * state.dir;
+    if (loopOf(pos)) {
+      const shift = (homed(pos) - pos) * state.dir;
+      restLeft += shift;
+      if (restedAt !== null) restedAt += shift;
+      restoredLeft = scroller.scrollLeft + shift;
+      onRepeat(null, restoredLeft);
+      __scrollingInternally = true;
+      scroller.scrollTo({ left: restoredLeft, behavior: "instant" as ScrollBehavior });
+    }
     const left = scroller.scrollLeft;
     const d = left - restLeft;
     const back = Math.abs(d - state.period * Math.round(d / state.period)) < 0.5;
@@ -859,34 +1054,35 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
     let pos = scrollStart * state.dir; // logical (always >= 0)
     const { period, scrollerWidth } = state;
 
-    // the ticker wraps on its own, and exactly
-    const end = state.end * state.dir;
+    // out of room: back to the middle. the ticker does so on its own
+    // (a carousel put back in the document starts again, at scroll position 0)
     const wrapped =
-      state.isDragging || isTicking.value
-        ? null
-        : pos > end
-          ? 4
-          : pos < 4
-            ? end
-            : null;
+      !state.isDragging && !isTicking.value && astray(pos)
+        ? pos < 1
+          ? loopStart + startOffset
+          : homed(pos)
+        : null;
     // the slides are placed for where the scroll is about to be
     if (wrapped !== null) pos = wrapped;
     const slides = Array.from(scroller.children) as HTMLElement[];
 
-    // show each slide one loop over when that copy is the one on screen:
-    // the copy nearest the middle of the viewport (any slide may go either way)
+    // every slide is shown in the loop nearest the middle of the viewport: in
+    // its own position while the scroll is among them
     slides.forEach((slide, i) => {
       const extent = loopSlides[i];
       if (!extent) return;
       const shift =
         period *
         Math.round((pos + scrollerWidth / 2 - (extent.start + extent.end) / 2) / period);
-      const visible =
-        extent.start + shift < pos + scrollerWidth && extent.end + shift > pos;
-      slide.style.translate = `${visible ? shift * state.dir : 0}px 0`;
+      // written again when something else wrote the style over it
+      if (shift === extent.shift && slide.style.translate === extent.css) return;
+      slide.style.translate = `${shift * state.dir}px 0`;
+      extent.shift = shift;
+      extent.css = slide.style.translate;
     });
 
     if (wrapped === null) return;
+    restoredLeft = wrapped * state.dir;
     __scrollingInternally = true;
     scroller.scrollTo({
       left: wrapped * state.dir,
@@ -981,16 +1177,10 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
     }
 
     if (state.period) {
-      // wrap into [0, period) by exactly one loop, shifting target too so it
-      // keeps its lead: momentum and programmatic scrolls carry on through the
-      // seam at the same speed (onRepeat leaves the wrapping to the ticker)
+      // out of room (see setRoom): back to the middle by whole loops, shifting
+      // target too so it keeps its lead and the scroll carries on at speed
       const pos = virtualScroll.x * state.dir;
-      const shift =
-        pos >= state.period
-          ? -state.period * state.dir
-          : pos < 0
-            ? state.period * state.dir
-            : 0;
+      const shift = astray(pos) ? (homed(pos) - pos) * state.dir : 0;
       virtualScroll.x += shift;
       target.x += shift;
       destination += shift;
@@ -1102,12 +1292,11 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
   scroller.scrollBy = scrollByOverride;
 
   /**
-   * repeat: the browser can't animate a programmatic scroll across the seam
-   * (the wrap in onRepeat cancels it halfway), so a smooth one is run by the
-   * ticker instead, which wraps as it goes and may head beyond the seam; an
-   * instant one jumps to the same spot inside the scroll range. Returns false
-   * to leave the scroll to the browser: one without an inline position, or
-   * before there is anything to loop.
+   * repeat: a programmatic scroll is taken the short way round the loop: any
+   * number of whole loops ends in the same place. A smooth one is run by the
+   * ticker, so that it lands on its destination and can be snapped; an instant
+   * one jumps. Returns false to leave the scroll to the browser: one without
+   * an inline position, or before there is anything to loop.
    */
   function repeatScroll(args: any[], base: number): boolean {
     const opts: ScrollToOptions =
@@ -1121,11 +1310,15 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
     )
       return false;
 
-    const left = (base + opts.left) * state.dir; // logical, may be out of range
-    const pos = ((left % state.period) + state.period) % state.period;
-    // a rest within 4px of the seam would be wrapped 4px off afterwards
-    // (onRepeat): stop at the edge of that band instead
-    const rest = Math.min(Math.max(pos, 4), state.end * state.dir);
+    // any number of whole loops ends in the same place: once round at most.
+    // a position from outside the scroll range's middle (0, say, or a slide's
+    // offsetLeft loops away) is taken the short way
+    const from = scroller.scrollLeft * state.dir;
+    let delta = (base + opts.left) * state.dir - from;
+    if (Math.abs(delta) > ROOM / 4)
+      delta -= state.period * Math.round(delta / state.period);
+    else if (Math.abs(delta) > state.period) delta %= state.period;
+    const to = (from + delta) * state.dir;
 
     stirred = true;
     const behavior = opts.behavior ?? "auto";
@@ -1138,7 +1331,7 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
       isTicking.value = false;
       __scrollingInternally = true;
       scroller.scrollTo({
-        left: rest * state.dir,
+        left: to,
         behavior: "instant" as ScrollBehavior,
       });
       return true;
@@ -1153,10 +1346,7 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
       if (typeof now === "number") lastTick = now;
     }
     animating = true;
-    destination = (left + rest - pos) * state.dir;
-    // any number of whole loops ends in the same place: go round once at most
-    if (Math.abs(destination - target.x) > state.period)
-      destination = target.x + ((destination - target.x) % state.period);
+    destination = to;
 
     // like native snapping, announce the snap target being headed for
     if (state.hasSnap && state.snapPositions.length) {
@@ -1181,8 +1371,8 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
   }
 
   /**
-   * repeat: a native scrollIntoView stops at the edge of the scroll range,
-   * where the wrap cuts it off, though the target may be nearer round the loop.
+   * repeat: a native scrollIntoView goes to where the target is laid out,
+   * though it may be shown nearer, a loop on.
    * The browser still scrolls everything else (the page, containers inside a
    * slide); the carousel's own inline scroll is put back and run like scrollTo,
    * to the nearest copy of the target. Returns what to do after the native call.

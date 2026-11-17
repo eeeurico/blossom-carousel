@@ -168,9 +168,9 @@ export function dragSnap(
     });
   }
   state.activeSnapPosition = newSnapPosition;
-  // repeat: the position may lie beyond the seam, the ticker wraps on the way
+  // repeat: every position is in reach (see setRoom)
   const slideX = state.period
-    ? restInLoop(newSnapPosition.x, state)
+    ? newSnapPosition.x
     : clamp(
         newSnapPosition.x,
         Math.min((state.scrollerScrollWidth - state.scrollerWidth) * state.dir, 0),
@@ -212,17 +212,6 @@ export function snapSelect(
     }
   }
   return period ? { ...nearest, x: nearestX } : nearest;
-}
-
-/**
- * repeat: x moved (by 4px at most) out of the band around the seam, where a
- * scroll at rest gets wrapped to the other side (see onRepeat).
- */
-export function restInLoop(x: number, state: CarouselState): number {
-  const { period, dir } = state;
-  if (period < 8) return x;
-  const pos = (((x * dir) % period) + period) % period;
-  return x + (Math.min(Math.max(pos, 4), period - 4) - pos) * dir;
 }
 
 function hasChanged(position: SnapPosition, state: CarouselState): boolean {

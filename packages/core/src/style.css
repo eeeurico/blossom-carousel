@@ -22,18 +22,51 @@
     }
 
     &[has-repeat="true"] {
-      /* off-centre by 8px so that the seam doesn't fall on the slides' start
-         and end snap positions: a scroll resting within 4px of the seam gets
-         wrapped 4px off (see onRepeat) */
-      padding-inline: calc(50% - 8px) calc(50% + 8px) !important;
+      padding-inline: 50% !important;
+      /* the scroll range is many loops long, with the slides in the middle
+         (see setRoom): ::before is the room before them, a first column in a
+         grid, ::after marks the end of the room beyond them */
+      grid-template-columns: var(--blossom-repeat-lead, 0px);
+      position: relative;
+      overflow-anchor: none;
+
+      &::before,
+      &::after {
+        content: "" !important;
+        box-sizing: content-box !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        border: 0 !important;
+        visibility: hidden !important;
+        pointer-events: none !important;
+      }
+      &::before {
+        display: inline-block !important;
+        position: static !important;
+        float: none !important;
+        flex: none !important;
+        order: -9999 !important;
+        grid-area: 1 / 1 / -1 / 2 !important;
+        vertical-align: top !important;
+        inline-size: var(--blossom-repeat-lead, 0px) !important;
+        block-size: 0 !important;
+      }
+      &::after {
+        position: absolute !important;
+        inset: 0 auto auto auto !important;
+        inset-inline-start: var(--blossom-repeat-reach, 0px) !important;
+        /* a box without area doesn't count for the scroll range */
+        inline-size: 1px !important;
+        block-size: 1px !important;
+      }
     }
 
     &[has-snap="true"] {
       scroll-snap-type: var(--snap-type) !important;
     }
 
-    /* native snapping fights the wrap (in WebKit it never comes to rest):
-       core snaps drags and programmatic scrolls itself */
+    /* native snapping doesn't follow the slides as the loop moves them
+       (Chromium): core does the snapping itself */
     &[has-repeat="true"] {
       scroll-snap-type: none !important;
     }
