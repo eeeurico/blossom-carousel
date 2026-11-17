@@ -4,7 +4,7 @@ import {
   getMarkerTargets,
 } from "./markers";
 import { canScroll } from "./scroll";
-import { getMarkerSnaps, getSnapPositions, isRtl, repeatPeriod } from "./snap";
+import { getMarkerSnaps, getSnapPositions, isRepeat, isRtl, repeatPeriod } from "./snap";
 import { clearSnapCache, getSnapCache, setSnapCache } from "./cache";
 import type { NavigationState } from "./types";
 
@@ -90,7 +90,29 @@ function createRegistration(scroller: HTMLElement): ObserverRegistration {
   const borderBoxObserver = new ResizeObserver(onLayoutChange);
   borderBoxObserver.observe(scroller, { box: "border-box" });
 
-  const mutationObserver = new MutationObserver(onLayoutChange);
+  // slides can change size without a dom mutation (an image loading, a class
+  // or style change)
+  const slides = new Set<Element>();
+  const observeSlides = () => {
+    // only a loop is thrown by it: its period and seam move with every slide
+    const children = new Set(isRepeat(scroller) ? Array.from(scroller.children) : []);
+    for (const slide of slides) {
+      if (children.has(slide)) continue;
+      borderBoxObserver.unobserve(slide);
+      slides.delete(slide);
+    }
+    for (const slide of children) {
+      if (slides.has(slide)) continue;
+      borderBoxObserver.observe(slide, { box: "border-box" });
+      slides.add(slide);
+    }
+  };
+  observeSlides();
+
+  const mutationObserver = new MutationObserver(() => {
+    observeSlides();
+    onLayoutChange();
+  });
   mutationObserver.observe(scroller, {
     childList: true,
     subtree: true,

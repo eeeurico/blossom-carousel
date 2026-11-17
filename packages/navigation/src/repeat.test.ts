@@ -425,10 +425,12 @@ describe("without has-repeat", () => {
 describe("observeNavigationState with repeat", () => {
   function stubObservers() {
     const resizeBoxes: (ResizeObserverOptions | undefined)[] = [];
+    const resizeTargets: Element[] = [];
     vi.stubGlobal(
       "ResizeObserver",
       class {
-        observe(_: Element, options?: ResizeObserverOptions) {
+        observe(target: Element, options?: ResizeObserverOptions) {
+          resizeTargets.push(target);
           resizeBoxes.push(options);
         }
         disconnect() {}
@@ -443,15 +445,35 @@ describe("observeNavigationState with repeat", () => {
     const runFrames = () => {
       for (const cb of frames.splice(0)) cb(0);
     };
-    return { resizeBoxes, runFrames };
+    return { resizeBoxes, resizeTargets, runFrames };
   }
 
   it("observes the border box too: the padded content box is 0 wide", async () => {
-    const { resizeBoxes } = stubObservers();
+    const { resizeBoxes, resizeTargets } = stubObservers();
     const { scroller } = layout();
     const { observeNavigationState } = await import("./observe");
     const stop = observeNavigationState(scroller, () => {});
-    expect(resizeBoxes).toEqual([undefined, { box: "border-box" }]);
+    const boxes = resizeTargets
+      .map((target, i) => [target, resizeBoxes[i]] as const)
+      .filter(([target]) => target === scroller)
+      .map(([, box]) => box);
+    expect(boxes).toEqual([undefined, { box: "border-box" }]);
+    stop();
+  });
+
+  it("observes the border box of every slide, and of slides added later", async () => {
+    const { resizeBoxes, resizeTargets } = stubObservers();
+    const { scroller } = layout();
+    const { observeNavigationState } = await import("./observe");
+    const stop = observeNavigationState(scroller, () => {});
+    const boxOf = (el: Element) => resizeBoxes[resizeTargets.lastIndexOf(el)];
+    for (const slide of Array.from(scroller.children))
+      expect(boxOf(slide)).toEqual({ box: "border-box" });
+
+    const added = document.createElement("div");
+    scroller.append(added);
+    await Promise.resolve(); // MutationObserver delivery
+    expect(boxOf(added)).toEqual({ box: "border-box" });
     stop();
   });
 
