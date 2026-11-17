@@ -193,6 +193,25 @@ function setup({
   };
 }
 
+/**
+ * Records capture listeners, to hand them a browser event: dispatchEvent only
+ * ever delivers untrusted ones.
+ */
+function captureListeners() {
+  const spy = vi.spyOn(EventTarget.prototype, "addEventListener");
+  return (target: EventTarget, type: string) =>
+    spy.mock.calls
+      .filter(
+        ([t, , options], i) =>
+          spy.mock.contexts[i] === target &&
+          t === type &&
+          (options === true || (typeof options === "object" && !!options.capture)),
+      )
+      .map(([, listener]) => listener as EventListener);
+}
+const browserEvent = (type: string, target: EventTarget) =>
+  ({ type, target, isTrusted: true, stopImmediatePropagation: vi.fn() }) as unknown as Event;
+
 /** Undoes the ticker's one-loop wraps so the path can be checked for monotony. */
 function unwrap(lefts: number[], period: number): number[] {
   let offset = 0;
@@ -212,6 +231,7 @@ afterEach(() => {
   destroy = undefined;
   restoreTouch?.();
   restoreTouch = undefined;
+  vi.useRealTimers();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   document.body.replaceChildren();
@@ -301,9 +321,11 @@ describe.each([
   });
 
   it("dispatches scrollend once it has landed", () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const t = setup({ dir, pointer });
     destroy = t.blossom.destroy;
     t.scrollToPosition(350 * s);
+    vi.advanceTimersByTime(100);
     const ends = vi.fn();
     t.scroller.addEventListener("scrollend", ends);
 
@@ -311,7 +333,33 @@ describe.each([
     t.frame();
     expect(ends).not.toHaveBeenCalled();
     t.settle();
-    expect(ends).toHaveBeenCalled();
+    // like native snapping, once the scroll has rested a while
+    expect(ends).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(100);
+    expect(ends).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(1000);
+    expect(ends).toHaveBeenCalledTimes(1);
+  });
+
+  it("swallows the browser's own scrollend, not its own", () => {
+    const listeners = captureListeners();
+    const t = setup({ dir, pointer });
+    destroy = t.blossom.destroy;
+    const ends = vi.fn();
+    t.scroller.addEventListener("scrollend", ends);
+
+    const event = browserEvent("scrollend", t.scroller);
+    expect(listeners(t.scroller, "scrollend")).toHaveLength(1);
+    for (const listener of listeners(t.scroller, "scrollend")) listener(event);
+    expect(event.stopImmediatePropagation).toHaveBeenCalled();
+
+    // a scroll container inside a slide keeps its own
+    const inner = browserEvent("scrollend", t.scroller.firstElementChild!);
+    for (const listener of listeners(t.scroller, "scrollend")) listener(inner);
+    expect(inner.stopImmediatePropagation).not.toHaveBeenCalled();
+
+    t.scroller.dispatchEvent(new Event("scrollend"));
+    expect(ends).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -462,10 +510,12 @@ describe("repeat: next/prev methods", () => {
 
 describe("repeat: snap target announcement", () => {
   it("announces the slide a smooth scroll is heading to, across the seam", () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const t = setup({ snapType: "x mandatory", align: "start" });
     destroy = t.blossom.destroy;
-    // slide 3 at the start edge
+    // slide 3 at the start edge, at rest
     t.scrollToPosition(PAD_START + 3 * SLIDE);
+    vi.advanceTimersByTime(100);
     const changing = vi.fn();
     t.scroller.addEventListener("scrollsnapchanging", (e) =>
       changing((e as CustomEvent).detail.snapTargetInline),
@@ -478,6 +528,84 @@ describe("repeat: snap target announcement", () => {
     expect(changing).toHaveBeenCalledWith(t.slides[0]);
     t.settle();
     expect(t.getScrollLeft()).toBe(PAD_START);
+  });
+
+  it("announces a scroll it didn't run once it rests: changing, change, then scrollend", () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const t = setup({ snapType: "x mandatory", align: "start" });
+    destroy = t.blossom.destroy;
+    const events: string[] = [];
+    for (const type of ["scrollsnapchanging", "scrollsnapchange", "scrollend"])
+      t.scroller.addEventListener(type, () => events.push(type));
+
+    t.scrollToPosition(PAD_START + 2 * SLIDE);
+    expect(events).toEqual([]);
+    vi.advanceTimersByTime(100);
+
+    expect(events).toEqual(["scrollsnapchanging", "scrollsnapchange", "scrollend"]);
+  });
+
+  it("fires scrollend once per scroll, scrollsnapchange only when the target changed", () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const t = setup({ snapType: "x mandatory", align: "start" });
+    destroy = t.blossom.destroy;
+    const ends = vi.fn();
+    const changes = vi.fn();
+    t.scroller.addEventListener("scrollend", ends);
+    t.scroller.addEventListener("scrollsnapchange", (e) =>
+      changes((e as CustomEvent).detail.snapTargetInline),
+    );
+    const land = () => {
+      t.settle();
+      vi.advanceTimersByTime(100);
+      t.settle();
+      vi.advanceTimersByTime(100);
+    };
+
+    t.scroller.scrollTo({ left: PAD_START + SLIDE, behavior: "smooth" });
+    land();
+    expect(t.getScrollLeft()).toBe(PAD_START + SLIDE);
+    expect(ends).toHaveBeenCalledTimes(1);
+    expect(changes).toHaveBeenCalledTimes(1);
+    expect(changes).toHaveBeenLastCalledWith(t.slides[1]);
+
+    // pushed off slide 1 and snapped back to it
+    t.scrollToPosition(PAD_START + SLIDE + 30);
+    land();
+    expect(t.getScrollLeft()).toBe(PAD_START + SLIDE);
+    expect(ends).toHaveBeenCalledTimes(2);
+    expect(changes).toHaveBeenCalledTimes(1);
+
+    t.scroller.scrollTo({ left: PAD_START + 3 * SLIDE, behavior: "smooth" });
+    land();
+    expect(ends).toHaveBeenCalledTimes(3);
+    expect(changes).toHaveBeenCalledTimes(2);
+    expect(changes).toHaveBeenLastCalledWith(t.slides[3]);
+  });
+
+  it("stays quiet when nothing moved", () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const t = setup({ snapType: "x mandatory", align: "start" });
+    destroy = t.blossom.destroy;
+    const events = vi.fn();
+    for (const type of ["scrollsnapchanging", "scrollsnapchange", "scrollend"])
+      t.scroller.addEventListener(type, events);
+
+    vi.advanceTimersByTime(1000);
+    t.resize();
+    vi.advanceTimersByTime(1000);
+
+    expect(events).not.toHaveBeenCalled();
+  });
+});
+
+describe("without repeat: events", () => {
+  it("leaves the browser's own scrollend alone", () => {
+    const listeners = captureListeners();
+    const t = setup({ repeat: false, pointer: "mouse" });
+    destroy = t.blossom.destroy;
+
+    expect(listeners(t.scroller, "scrollend")).toEqual([]);
   });
 });
 

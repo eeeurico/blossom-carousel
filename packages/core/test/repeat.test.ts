@@ -20,18 +20,24 @@ const SCROLL = PADDING * 2 + SLIDE * COUNT; // 600
 const PERIOD = SCROLL - CLIENT; // 400
 const END = PERIOD - 4; // 396
 
-type Observed = { callback: () => void; options?: ResizeObserverOptions };
+type Observed = {
+  callback: () => void;
+  boxes: Map<Element, ResizeObserverOptions | undefined>;
+};
 
 function setup(direction: "ltr" | "rtl", repeat = true) {
-  const observed: Observed = { callback: () => {} };
+  const observed: Observed = { callback: () => {}, boxes: new Map() };
   vi.stubGlobal(
     "ResizeObserver",
     class {
       constructor(callback: () => void) {
         observed.callback = callback;
       }
-      observe(_: Element, options?: ResizeObserverOptions) {
-        observed.options = options;
+      observe(target: Element, options?: ResizeObserverOptions) {
+        observed.boxes.set(target, options);
+      }
+      unobserve(target: Element) {
+        observed.boxes.delete(target);
       }
       disconnect() {}
     },
@@ -70,6 +76,19 @@ function setup(direction: "ltr" | "rtl", repeat = true) {
     get: () => scrollLeft,
     set: (value: number) => (scrollLeft = value),
   });
+  scroller.getBoundingClientRect = () => new DOMRect(0, 0, CLIENT, 100);
+  slides.forEach((slide, i) => {
+    slide.getBoundingClientRect = () => {
+      const start = PADDING + i * SLIDE; // logical, natural
+      const logical = direction === "rtl" ? -scrollLeft : scrollLeft;
+      const tx = parseFloat(slide.style.translate) || 0;
+      const x =
+        direction === "rtl"
+          ? CLIENT - (start - logical) - SLIDE + tx
+          : start - logical + tx;
+      return new DOMRect(x, 0, SLIDE, 100);
+    };
+  });
   const scrollTo = vi.fn();
   scroller.scrollTo = scrollTo as unknown as typeof scroller.scrollTo;
   scroller.scrollBy = vi.fn() as unknown as typeof scroller.scrollBy;
@@ -103,17 +122,48 @@ describe("repeat", () => {
   });
 
   it("observes the border box, the content box is 0 wide", () => {
-    const { blossom, observed } = setup("ltr");
+    const { blossom, observed, scroller } = setup("ltr");
     cleanup = blossom.destroy;
 
-    expect(observed.options).toEqual({ box: "border-box" });
+    expect(observed.boxes.get(scroller)).toEqual({ box: "border-box" });
   });
 
   it("keeps observing the content box without repeat", () => {
-    const { blossom, observed } = setup("ltr", false);
+    const { blossom, observed, scroller } = setup("ltr", false);
     cleanup = blossom.destroy;
 
-    expect(observed.options).toBeUndefined();
+    expect(observed.boxes.has(scroller)).toBe(true);
+    expect(observed.boxes.get(scroller)).toBeUndefined();
+  });
+
+  it("observes every slide's border box", () => {
+    const { blossom, observed, scroller } = setup("ltr");
+    cleanup = blossom.destroy;
+
+    for (const slide of Array.from(scroller.children))
+      expect(observed.boxes.get(slide)).toEqual({ box: "border-box" });
+  });
+
+  it("leaves the slides unobserved without repeat", () => {
+    const { blossom, observed, scroller } = setup("ltr", false);
+    cleanup = blossom.destroy;
+
+    for (const slide of Array.from(scroller.children))
+      expect(observed.boxes.has(slide)).toBe(false);
+  });
+
+  it("observes slides added later, and stops observing removed ones", async () => {
+    const { blossom, observed, scroller } = setup("ltr");
+    cleanup = blossom.destroy;
+
+    const added = document.createElement("div");
+    scroller.append(added);
+    const removed = scroller.firstElementChild!;
+    removed.remove();
+    await Promise.resolve(); // MutationObserver delivery
+
+    expect(observed.boxes.get(added)).toEqual({ box: "border-box" });
+    expect(observed.boxes.has(removed)).toBe(false);
   });
 
   describe("ltr", () => {
