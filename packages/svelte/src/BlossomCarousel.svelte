@@ -48,7 +48,8 @@
 
     // don't load if the user has no mouse.
     // overwritten by props.load: 'always'
-    if (!hasMouse && load !== "always") return;
+    // and by repeat, which needs the engine on every device
+    if (!hasMouse && load !== "always" && !repeat) return;
 
     const { Blossom } = await import("@blossom-carousel/core");
 

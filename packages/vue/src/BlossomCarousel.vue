@@ -113,7 +113,8 @@ onMounted(async () => {
 
   // don't load if the user has no mouse.
   // overwritten by props.load: 'always'
-  if (!hasMouse && props.load !== "always") return;
+  // and by props.repeat, which needs the engine on every device
+  if (!hasMouse && props.load !== "always" && !props.repeat) return;
 
   const { Blossom } = await import("@blossom-carousel/core");
 

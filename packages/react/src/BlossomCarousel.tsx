@@ -114,7 +114,8 @@ const BlossomCarousel = forwardRef<BlossomCarouselHandle, BlossomCarouselProps>(
         "(hover: hover) and (pointer: fine)",
       ).matches;
 
-      if (!hasMouse && load !== "always") return;
+      // repeat needs the engine on every device, touch included
+      if (!hasMouse && load !== "always" && !repeat) return;
 
       let destroyed = false;
 
