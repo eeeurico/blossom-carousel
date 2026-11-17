@@ -79,12 +79,7 @@ export function repeatPeriod(scroller: HTMLElement): number {
     end = Math.max(end, rect.right - shift + (parseFloat(styles.marginRight) || 0));
   }
   if (end <= start) return 0;
-  // The scroll range with every slide in its natural place.
-  const styles = getComputedStyle(scroller);
-  const padding =
-    (parseFloat(styles.paddingInlineStart) || 0) +
-    (parseFloat(styles.paddingInlineEnd) || 0);
-  return end - start + padding - scroller.clientWidth;
+  return end - start;
 }
 
 /**
