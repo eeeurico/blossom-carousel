@@ -22,12 +22,20 @@
     }
 
     &[has-repeat="true"] {
-      scroll-padding-inline: 50% !important;
-      padding-inline: 50% !important;
+      /* off-centre by 8px so that the seam doesn't fall on the slides' start
+         and end snap positions: a scroll resting within 4px of the seam gets
+         wrapped 4px off (see onRepeat) */
+      padding-inline: calc(50% - 8px) calc(50% + 8px) !important;
     }
 
     &[has-snap="true"] {
       scroll-snap-type: var(--snap-type) !important;
+    }
+
+    /* native snapping fights the wrap (in WebKit it never comes to rest):
+       core snaps drags and programmatic scrolls itself */
+    &[has-repeat="true"] {
+      scroll-snap-type: none !important;
     }
 
     &[has-overflow="true"] {

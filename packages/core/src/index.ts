@@ -4,13 +4,19 @@ import StyleObserver, { ReturnFormat } from '@bramus/style-observer';
 import { createState } from "./state";
 import { damp, round, resolveCSSLength } from "./utils";
 import { FRICTION, DAMPING } from "./constants";
-import { dispatchOverscrollEvent, dispatchScrollEndEvent } from "./events";
+import {
+  dispatchOverscrollEvent,
+  dispatchScrollEndEvent,
+  dispatchScrollSnapChangingEvent,
+} from "./events";
 import {
   findSnapPositions,
   onScrollSnapChange,
   onSnapChanging,
   dragSnap,
   shouldSnap,
+  snapSelect,
+  restInLoop,
 } from "./snap";
 import { prev, next } from "./methods";
 
@@ -44,6 +50,9 @@ function registerScrollIntoViewIntercept(
     }
   };
 }
+
+const isRTL = (el: HTMLElement): boolean =>
+  window.getComputedStyle(el).direction === "rtl";
 
 export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) => {
   const state = createState();
@@ -108,9 +117,21 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
     });
     window.addEventListener("keydown", onKeydown);
     scroller.addEventListener("scroll", onScroll);
+    if (options?.repeat) {
+      scroller.addEventListener("touchstart", onTouchStart, { passive: true });
+      scroller.addEventListener("touchend", onTouchEnd);
+      scroller.addEventListener("touchcancel", onTouchEnd);
+    }
+    scroller.scrollTo = scrollToOverride;
+    scroller.scrollBy = scrollByOverride;
 
     resizeObserver = new ResizeObserver(onResize);
-    resizeObserver.observe(scroller);
+    // repeat pads the scroller 50% on both sides, which leaves a zero-width
+    // content box: only the border box reports width changes.
+    resizeObserver.observe(
+      scroller,
+      options?.repeat ? { box: "border-box" } : undefined,
+    );
 
     mutationObserver = new MutationObserver(onMutation);
     mutationObserver.observe(scroller, {
@@ -141,7 +162,7 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
       "(hover: hover) and (pointer: fine)",
     ).matches;
 
-    state.dir = scroller.closest('[dir="rtl"]') ? -1 : 1;
+    state.dir = isRTL(scroller) ? -1 : 1;
 
     const { scrollSnapType } = window.getComputedStyle(scroller);
     state.hasSnap = scrollSnapType !== "none";
@@ -169,6 +190,27 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
 
     window.removeEventListener("keydown", onKeydown);
     scroller.removeEventListener("scroll", onScroll);
+    scroller.removeEventListener("touchstart", onTouchStart);
+    scroller.removeEventListener("touchend", onTouchEnd);
+    scroller.removeEventListener("touchcancel", onTouchEnd);
+    window.clearTimeout(settleTimer);
+    isTicking.value = false;
+    // removes the pointerdown and wheel listeners
+    hasOverflow.x = hasOverflow.y = false;
+    window.removeEventListener("pointermove", onPointerMove);
+    window.removeEventListener("pointerup", onPointerUp);
+    state.isDragging = false;
+
+    if (options?.repeat) {
+      // leave nothing of the loop behind: the attribute switches native
+      // snapping off and tells navigation to loop
+      scroller.removeAttribute("has-repeat");
+      for (const slide of Array.from(scroller.children) as HTMLElement[]) {
+        slide.style.translate = "";
+      }
+      state.period = 0;
+      hasStartPosition = false;
+    }
 
     links?.forEach((el) => {
       el.removeEventListener("click", onLinkClick);
@@ -189,6 +231,16 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
     if (!scroller) return;
 
     hasTouch = "ontouchmove" in window;
+    // the anchor of the last scroll event: a browser may already have clamped
+    // scrollLeft to what a DOM change left of the scroll range
+    const anchor = state.period ? (lastAnchor ?? repeatAnchor()) : null;
+    if (options?.repeat) {
+      // slides moved to the other side by onRepeat inflate scrollWidth:
+      // measure with every slide back in its natural position.
+      for (const slide of Array.from(scroller.children) as HTMLElement[]) {
+        slide.style.translate = "";
+      }
+    }
     state.scrollerScrollWidth = scroller.scrollWidth;
     state.scrollerWidth = scroller.clientWidth;
     state.scrollerScrollHeight = scroller.scrollHeight;
@@ -207,9 +259,12 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
     state.padding.start = resolveCSSLength(scroller, styles.paddingInlineStart);
     state.scrollPadding.start = resolveCSSLength(scroller, styles.scrollPaddingInlineStart);
     state.scrollPadding.end = resolveCSSLength(scroller, styles.scrollPaddingInlineEnd);
-    state.dir = scroller.closest('[dir="rtl"]') ? -1 : 1;
+    state.dir = isRTL(scroller) ? -1 : 1;
     state.end =
       (state.scrollerScrollWidth - state.scrollerWidth - 4) * state.dir;
+    state.period = options?.repeat
+      ? state.scrollerScrollWidth - state.scrollerWidth
+      : 0;
 
     if (state.hasSnap) {
       findSnapPositions(scroller, state);
@@ -227,7 +282,85 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
         };
       });
     }
-    if (options?.repeat) onRepeat(null, null);
+    if (options?.repeat) {
+      if (!hasStartPosition && state.period > 0) {
+        hasStartPosition = true;
+        scrollToRepeatStart();
+      } else if (anchor) {
+        restoreRepeatAnchor(anchor);
+      }
+      onRepeat(null, null);
+      lastAnchor = state.period ? repeatAnchor() : null;
+      settleSoon();
+    }
+  }
+
+  // The padding of a repeating scroller follows its width, so a resize moves
+  // everything by half the change. Hold on to what was aligned: the nearest
+  // snap target, or without snapping the content at the start edge.
+  type RepeatAnchor = { target: HTMLElement | null; offset: number; left: number };
+  let lastAnchor: RepeatAnchor | null = null;
+  function repeatAnchor(): RepeatAnchor {
+    const left = scroller.scrollLeft;
+    if (state.hasSnap && state.snapPositions.length) {
+      const nearest = snapSelect(left, 0, FRICTION, state);
+      return { target: nearest.target, offset: left - nearest.x, left };
+    }
+    return { target: null, offset: left - state.padding.start * state.dir, left };
+  }
+
+  function restoreRepeatAnchor(anchor: RepeatAnchor): void {
+    if (!state.period) return;
+    const base = anchor.target
+      ? state.snapPositions.find(({ target }) => target === anchor.target)?.x
+      : state.padding.start * state.dir;
+    if (base === undefined) return;
+
+    const pos =
+      ((((base + anchor.offset) * state.dir) % state.period) + state.period) %
+      state.period;
+    const left = restInLoop(pos * state.dir, state);
+    // the ticker's own position moves along
+    const shift = left - anchor.left;
+    virtualScroll.x += shift;
+    target.x += shift;
+    destination += shift;
+
+    if (Math.abs(left - scroller.scrollLeft) < 0.5) return;
+    __scrollingInternally = true;
+    scroller.scrollTo({ left, behavior: "instant" as ScrollBehavior });
+  }
+
+  // A repeating scroller is padded by half its width on both sides, so
+  // scrollLeft 0 shows the first slide in the middle. Start where a carousel
+  // without repeat starts: on the first slide, at its own snap alignment.
+  let hasStartPosition = false;
+  function scrollToRepeatStart(): void {
+    const first = scroller.firstElementChild as HTMLElement | null;
+    if (!first) return;
+
+    const rect = first.getBoundingClientRect();
+    const scrollerRect = scroller.getBoundingClientRect();
+    const start =
+      (state.dir === -1
+        ? scrollerRect.right - rect.right
+        : rect.left - scrollerRect.left) +
+      scroller.scrollLeft * state.dir;
+    const align = state.hasSnap
+      ? window.getComputedStyle(first).scrollSnapAlign.trim().split(/\s+/).pop()
+      : "start";
+
+    let x = start - state.scrollPadding.start;
+    if (align === "center") x = start + rect.width / 2 - state.scrollerWidth / 2;
+    if (align === "end")
+      x = start + rect.width - state.scrollerWidth + state.scrollPadding.end;
+
+    x = ((x % state.period) + state.period) % state.period;
+    __scrollingInternally = true;
+    scroller.scrollTo({
+      left: Math.min(Math.max(x, 4), state.end * state.dir) * state.dir,
+      behavior: "instant" as ScrollBehavior,
+    });
   }
 
   function onMutation(): void {
@@ -237,6 +370,8 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
   function onScroll() {
     if (options?.repeat) {
       onRepeat(null, null);
+      if (state.period) lastAnchor = repeatAnchor();
+      settleSoon();
       return;
     }
 
@@ -282,6 +417,9 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
 
     distanceMovedSincePointerDown.x = 0;
     state.isDragging = true;
+    // the pointer takes over from a programmatic repeat scroll
+    animating = false;
+    stepping = false;
 
     window.addEventListener("pointermove", onPointerMove);
     window.addEventListener("pointerup", onPointerUp);
@@ -313,11 +451,14 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
 
     state.isDragging = false;
 
-    if (distanceMovedSincePointerDown.x <= 10) return;
+    if (distanceMovedSincePointerDown.x <= 10) {
+      settleSoon();
+      return;
+    }
     if (hasOverflow.x) velocity.x *= 2;
     if (hasOverflow.y) velocity.y *= 2;
 
-    if (shouldSnap(target.x, velocity.x, FRICTION, state) || target.x < 0 || target.x > state.end) {
+    if (shouldSnap(target.x, velocity.x, FRICTION, state) || target.x * state.dir < 0 || target.x * state.dir > state.end * state.dir) {
       velocity.x = dragSnap(target.x, velocity.x, FRICTION, state);
     }
     preventGlobalClick();
@@ -326,6 +467,8 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
   function onWheel(e: WheelEvent): void {
     if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
       isTicking.value = false;
+      stepping = true;
+      settleSoon(); // not while the wheel is still turning
       if (state.isDragging || !scroller) return;
       if (hasOverflow.x) virtualScroll.x = scroller.scrollLeft;
       if (hasOverflow.y) virtualScroll.y = scroller.scrollTop;
@@ -333,8 +476,92 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
   }
 
   function onKeydown(e: KeyboardEvent): void {
-    if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key))
-      isTicking.value = false;
+    if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(e.key))
+      return;
+
+    // repeat switches native snapping off, and with it the step that an arrow
+    // key takes to the next snap position (all WebKit does with one): step here
+    const horizontal = e.key === "ArrowLeft" || e.key === "ArrowRight";
+    if (
+      horizontal &&
+      state.period &&
+      state.hasSnap &&
+      !e.defaultPrevented &&
+      !(e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) &&
+      e.target instanceof Node &&
+      scroller.contains(e.target) &&
+      !(e.target as HTMLElement).isContentEditable &&
+      !["INPUT", "TEXTAREA", "SELECT"].includes((e.target as HTMLElement).tagName)
+    ) {
+      e.preventDefault();
+      const forward = (e.key === "ArrowRight") === (state.dir === 1);
+      (forward ? next : prev)(state);
+      return;
+    }
+
+    isTicking.value = false;
+    stepping = true;
+  }
+
+  // touch devices have no drag handling: a touch takes over from a
+  // programmatic repeat scroll here
+  let touching = false;
+  function onTouchStart(): void {
+    touching = true;
+    stepping = false;
+    if (animating) isTicking.value = false;
+  }
+
+  function onTouchEnd(e: TouchEvent): void {
+    touching = e.touches.length > 0;
+    settleSoon();
+  }
+
+  // repeat switches native snapping off (it fights the wrap, see style.css),
+  // so a scroll that core didn't run itself (wheel, keys, touch, an instant
+  // or interrupted programmatic scroll) is snapped here once it has come to rest
+  let settleTimer = 0;
+  /** the wheel or an arrow key scrolled last: these step on, like native snapping */
+  let stepping = false;
+  /** where the scroll last rested on a snap position */
+  let restedAt: number | null = null;
+  function settleSoon(): void {
+    window.clearTimeout(settleTimer);
+    if (state.hasSnap && state.period)
+      settleTimer = window.setTimeout(settle, 100);
+  }
+
+  function settle(): void {
+    if (!scroller || state.isDragging || touching || isTicking.value) return;
+
+    const left = scroller.scrollLeft;
+    if (!shouldSnap(left, 0, FRICTION, state)) return;
+
+    let { x } = snapSelect(left, 0, FRICTION, state);
+    if (Math.abs(restInLoop(x, state) - left) < 1) {
+      restedAt = left;
+      stepping = false;
+      return;
+    }
+
+    // a wheel notch or a key press doesn't get halfway to the next position:
+    // rather than falling back, go on to the next one in its direction
+    if (stepping && restedAt !== null) {
+      const { period } = state;
+      const wrap = (d: number) => d - period * Math.round(d / period);
+      const moved = wrap(left - restedAt);
+      if (Math.abs(moved) > 10 && Math.abs(wrap(x - restedAt)) < 1) {
+        const sign = Math.sign(moved);
+        let step = period;
+        for (const position of state.snapPositions) {
+          const d = ((((position.x - restedAt) * sign) % period) + period) % period;
+          if (d > 1 && d < step) step = d;
+        }
+        x = restedAt + step * sign;
+      }
+    }
+    stepping = false;
+    scroller.scrollTo({ left: x, behavior: "smooth" });
   }
 
   /*********************
@@ -345,9 +572,10 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
     if (!scroller) return;
 
     const scrollStart = x ?? scroller.scrollLeft;
-    const distanceToStartEdge = state.padding.start - scrollStart;
+    const pos = scrollStart * state.dir; // logical (always >= 0)
+    const distanceToStartEdge = state.padding.start - pos;
     const distanceToEndEdge =
-      scrollStart -
+      pos -
       (state.scrollerScrollWidth - state.scrollerWidth - state.padding.end);
     const slides = Array.from(scroller.children) as HTMLElement[];
 
@@ -359,9 +587,7 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
     ) => {
       let offset = 0;
       const step = isEnd ? -1 : 1;
-      const baseOffset = isEnd
-        ? -(state.scrollerScrollWidth - state.scrollerWidth)
-        : state.scrollerScrollWidth - state.scrollerWidth;
+      const baseOffset = (isEnd ? -state.period : state.period) * state.dir;
 
       for (let i = startIdx; isEnd ? i >= endIdx : i < endIdx; i += step) {
         const thresholdCheck = isEnd ? offset > threshold : offset > threshold;
@@ -378,10 +604,11 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
     );
     offsetSlides(0, slides.length / 2, distanceToEndEdge, false);
 
-    if (state.isDragging) return;
+    // the ticker wraps on its own, and exactly
+    if (state.isDragging || isTicking.value) return;
 
     const left =
-      scrollStart > state.end ? 4 : scrollStart < 4 ? state.end : null;
+      pos > state.end * state.dir ? 4 * state.dir : pos < 4 ? state.end : null;
     if (!left) return;
     __scrollingInternally = true;
     scroller.scrollTo({
@@ -432,6 +659,7 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
         else if (!value) {
           if (raf) cancelAnimationFrame(raf);
           raf = null;
+          animating = false;
           scroller.removeEventListener("scrollend", onScrollEnd);
         }
 
@@ -444,13 +672,18 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
 
   let frameDelta = 0;
   let lastTick = 0;
+  /** A programmatic repeat scroll is being animated by the ticker, to destination. */
+  let animating = false;
+  let destination = 0;
   function tick(t: number): void {
     raf = requestAnimationFrame(tick);
     frameDelta = t - lastTick;
 
     if (!scroller) return;
 
-    if (hasOverflow.x) {
+    // a programmatic repeat scroll runs on touch devices too, where hasOverflow
+    // is kept false so the native touch scrolling stays in charge
+    if (hasOverflow.x || animating) {
       velocity.x *= FRICTION;
       if (!state.isDragging) {
         target.x += velocity.x;
@@ -471,11 +704,29 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
     }
 
     if (options?.repeat) {
-      if (virtualScroll.x > state.end) {
-        virtualScroll.x = target.x = 4;
-      }
-      if (virtualScroll.x < 4) {
-        virtualScroll.x = target.x = state.end;
+      // wrap into [0, period) by exactly one loop, shifting target too so it
+      // keeps its lead: momentum and programmatic scrolls carry on through the
+      // seam at the same speed (onRepeat leaves the wrapping to the ticker)
+      const pos = virtualScroll.x * state.dir;
+      const shift =
+        pos >= state.period
+          ? -state.period * state.dir
+          : pos < 0
+            ? state.period * state.dir
+            : 0;
+      virtualScroll.x += shift;
+      target.x += shift;
+      destination += shift;
+
+      // a programmatic scroll only approaches its destination: land on it
+      if (
+        animating &&
+        Math.abs(destination - virtualScroll.x) < 0.5 &&
+        Math.abs(velocity.x) < 0.5
+      ) {
+        virtualScroll.x = target.x = destination;
+        velocity.x = 0;
+        animating = false;
       }
     }
 
@@ -490,12 +741,14 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
       onSnapChanging(target.x, velocity.x, FRICTION, state);
     }
 
-    if (!state.isDragging && round(velocity.x, 12) === 0) {
+    if (!state.isDragging && !animating && round(velocity.x, 12) === 0) {
       isTicking.value = false;
       dispatchScrollEndEvent(scroller);
       if (state.hasSnap) {
         onScrollSnapChange(state);
       }
+      // momentum only approaches the snap position: land on it
+      settleSoon();
     }
 
     if (!options?.repeat) {
@@ -548,20 +801,103 @@ export const Blossom = (scroller: HTMLElement, options: CarouselOptions = {}) =>
   const originalScrollBy = scroller.scrollBy;
 
   const scrollTo = scroller.scrollTo.bind(scroller);
-  scroller.scrollTo = function (...args: any[]) {
+  const scrollToOverride = function (...args: any[]) {
     const internal = __scrollingInternally === true;
-    if (!internal) isTicking.value = false;
     __scrollingInternally = false;
+    if (!internal && options?.repeat && repeatScroll(args, 0)) return;
+    if (!internal) isTicking.value = false;
     scrollTo(...args);
   };
 
   const scrollBy = scroller.scrollBy.bind(scroller);
-  scroller.scrollBy = function (...args: any[]) {
+  const scrollByOverride = function (...args: any[]) {
     const internal = __scrollingInternally === true;
-    if (!internal) isTicking.value = false;
     __scrollingInternally = false;
+    if (!internal && options?.repeat && repeatScroll(args, scroller.scrollLeft))
+      return;
+    if (!internal) isTicking.value = false;
     scrollBy(...args);
   };
+  scroller.scrollTo = scrollToOverride;
+  scroller.scrollBy = scrollByOverride;
+
+  /**
+   * repeat: the browser can't animate a programmatic scroll across the seam
+   * (the wrap in onRepeat cancels it halfway), so a smooth one is run by the
+   * ticker instead, which wraps as it goes and may head beyond the seam; an
+   * instant one jumps to the same spot inside the scroll range. Returns false
+   * to leave the scroll to the browser: one without an inline position, or
+   * before there is anything to loop.
+   */
+  function repeatScroll(args: any[], base: number): boolean {
+    const opts: ScrollToOptions =
+      typeof args[0] === "object" && args[0] !== null
+        ? args[0]
+        : { left: args[0], top: args[1] };
+    if (
+      !state.period ||
+      typeof opts.left !== "number" ||
+      !Number.isFinite(opts.left)
+    )
+      return false;
+
+    const left = (base + opts.left) * state.dir; // logical, may be out of range
+    const pos = ((left % state.period) + state.period) % state.period;
+    // a rest within 4px of the seam would be wrapped 4px off afterwards
+    // (onRepeat): stop at the edge of that band instead
+    const rest = Math.min(Math.max(pos, 4), state.end * state.dir);
+
+    const behavior = opts.behavior ?? "auto";
+    const smooth =
+      behavior === "smooth" ||
+      (behavior === "auto" &&
+        window.getComputedStyle(scroller).scrollBehavior === "smooth");
+
+    if (!smooth) {
+      isTicking.value = false;
+      __scrollingInternally = true;
+      scroller.scrollTo({
+        left: rest * state.dir,
+        behavior: "instant" as ScrollBehavior,
+      });
+      return true;
+    }
+
+    if (!isTicking.value) {
+      virtualScroll.x = target.x = scroller.scrollLeft;
+      isTicking.value = true;
+      // the next frame's rAF timestamp can predate performance.now() here
+      // (Firefox): a negative first frameDelta would step backwards
+      const now = document.timeline?.currentTime;
+      if (typeof now === "number") lastTick = now;
+    }
+    animating = true;
+    destination = (left + rest - pos) * state.dir;
+    // any number of whole loops ends in the same place: go round once at most
+    if (Math.abs(destination - target.x) > state.period)
+      destination = target.x + ((destination - target.x) % state.period);
+
+    // like native snapping, announce the snap target being headed for
+    if (state.hasSnap && state.snapPositions.length) {
+      const distance = (x: number) => {
+        const d = x - destination;
+        return Math.abs(d - state.period * Math.round(d / state.period));
+      };
+      const next = state.snapPositions.reduce((a, b) =>
+        distance(b.x) < distance(a.x) ? b : a,
+      );
+      if (next.target !== state.activeSnapPosition.target) {
+        state.activeSnapPosition = next;
+        dispatchScrollSnapChangingEvent(scroller, {
+          snapTargetInline: next.target,
+          snapTargetBlock: next.target,
+        });
+      }
+    }
+    // the velocity whose friction-decayed sum carries target there
+    velocity.x = ((destination - target.x) * (1 - FRICTION)) / FRICTION;
+    return true;
+  }
 
   /******************************
    ********* UTILS **************

@@ -22,6 +22,8 @@ export type CarouselState = {
   snapPositions: SnapPosition[];
   activeSnapPosition: SnapPosition;
   dir: number;
+  /** repeat: logical length of one loop (scroll positions s and s ± period look the same); 0 without repeat */
+  period: number;
 };
 
 export function createState(): CarouselState {
@@ -41,5 +43,6 @@ export function createState(): CarouselState {
     snapPositions: [],
     activeSnapPosition: { target: null, x: 0, y: 0 },
     dir: 1,
+    period: 0,
   };
 }

@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { clamp, lerp, project, round } from "../src/utils";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { clamp, lerp, project, resolveCSSLength, round } from "../src/utils";
 
 describe("clamp", () => {
   it("returns the value when it is already in range", () => {
@@ -33,5 +33,37 @@ describe("round", () => {
 describe("project", () => {
   it("projects the resting position from target, velocity, and friction", () => {
     expect(project(100, 50, 0.5)).toBe(200);
+  });
+});
+
+describe("resolveCSSLength", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    document.body.replaceChildren();
+  });
+
+  it("returns pixel lengths as they are, without layout", () => {
+    const measure = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect");
+    expect(resolveCSSLength(document.body, "12px")).toBe(12);
+    expect(resolveCSSLength(document.body, "auto")).toBe(0);
+    expect(measure).not.toHaveBeenCalled();
+  });
+
+  it("resolves a percentage through layout against the parent's width", () => {
+    const parent = document.createElement("div");
+    Object.defineProperty(parent, "clientWidth", { value: 300 });
+    let measured: { width: string; parent: string } | undefined;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      function (this: HTMLElement) {
+        measured = {
+          width: this.style.width,
+          parent: (this.parentElement as HTMLElement).style.width,
+        };
+        return new DOMRect(0, 0, 150, 0);
+      },
+    );
+
+    expect(resolveCSSLength(parent, "50%")).toBe(150); // not 50
+    expect(measured).toEqual({ width: "50%", parent: "300px" });
   });
 });

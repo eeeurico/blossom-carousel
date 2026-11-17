@@ -82,20 +82,24 @@ export function findSnapPositions(
       const styles = window.getComputedStyle(target);
       const marginStart = parseFloat(styles.scrollMarginInlineStart) || 0;
       const marginEnd = parseFloat(styles.scrollMarginInlineEnd) || 0;
-      const snapAreaStart = left - marginStart;
-      const snapAreaEnd = left + clientWidth + marginEnd;
+      // physical edges: in RTL the inline start is the right-hand one
+      const rtl = state.dir === -1;
+      const snapAreaStart = left - (rtl ? marginEnd : marginStart);
+      const snapAreaEnd = left + clientWidth + (rtl ? marginStart : marginEnd);
+      const paddingLeft = rtl ? state.scrollPadding.end : state.scrollPadding.start;
+      const paddingRight = rtl ? state.scrollPadding.start : state.scrollPadding.end;
 
-      switch (align) {
+      switch (rtl ? { start: "end", end: "start" }[align] || align : align) {
         case "start":
           return {
             target,
-            x: snapAreaStart - state.scrollPadding.start,
+            x: snapAreaStart - paddingLeft,
             y: 0,
           };
         case "end":
           return {
             target,
-            x: snapAreaEnd - state.scrollerWidth + state.scrollPadding.end,
+            x: snapAreaEnd - state.scrollerWidth + paddingRight,
             y: 0,
           };
         case "center":
@@ -145,12 +149,9 @@ export function shouldSnap(
     0,
   );
   const proximityThreshold = snapportWidth / 3;
-  const nearestDistance = state.snapPositions.reduce(
-    (distance, position) => Math.min(distance, Math.abs(position.x - restingX)),
-    Number.POSITIVE_INFINITY,
-  );
+  const nearest = snapSelect(target, velocity, friction, state);
 
-  return nearestDistance <= proximityThreshold;
+  return Math.abs(nearest.x - restingX) <= proximityThreshold;
 }
 
 export function dragSnap(
@@ -160,18 +161,21 @@ export function dragSnap(
   state: CarouselState,
 ): number {
   const newSnapPosition = snapSelect(target, velocity, friction, state);
-  if (newSnapPosition.x !== state.activeSnapPosition.x) {
+  if (hasChanged(newSnapPosition, state)) {
     dispatchScrollSnapChangingEvent(state.scroller, {
       snapTargetInline: (newSnapPosition || state.activeSnapPosition).target,
       snapTargetBlock: (newSnapPosition || state.activeSnapPosition).target,
     });
   }
   state.activeSnapPosition = newSnapPosition;
-  const slideX = clamp(
-    newSnapPosition.x,
-    Math.min((state.scrollerScrollWidth - state.scrollerWidth) * state.dir, 0),
-    Math.max((state.scrollerScrollWidth - state.scrollerWidth) * state.dir, 0),
-  );
+  // repeat: the position may lie beyond the seam, the ticker wraps on the way
+  const slideX = state.period
+    ? restInLoop(newSnapPosition.x, state)
+    : clamp(
+        newSnapPosition.x,
+        Math.min((state.scrollerScrollWidth - state.scrollerWidth) * state.dir, 0),
+        Math.max((state.scrollerScrollWidth - state.scrollerWidth) * state.dir, 0),
+      );
   const distance = slideX - target;
   const force = distance * (1 - FRICTION) * (1 / FRICTION);
   return force;
@@ -184,15 +188,48 @@ export function snapSelect(
   state: CarouselState,
 ): SnapPosition {
   const restingX = project(target, velocity, friction);
-  return state.snapPositions.length
-    ? state.snapPositions.reduce((prev, curr) =>
-        Math.abs(curr.x - restingX) < Math.abs(prev.x - restingX) ? curr : prev,
-      )
-    : {
-        target: null,
-        x: clamp(restingX, Math.min(state.end, 0), Math.max(state.end, 0)),
-        y: 0,
-      };
+  if (!state.snapPositions.length) {
+    return {
+      target: null,
+      x: clamp(restingX, Math.min(state.end, 0), Math.max(state.end, 0)),
+      y: 0,
+    };
+  }
+
+  // repeat: every position comes round again one loop on, take the occurrence
+  // nearest to where the scroll comes to rest
+  const { period } = state;
+  const near = (x: number) =>
+    period ? x - period * Math.round((x - restingX) / period) : x;
+
+  let nearest = state.snapPositions[0];
+  let nearestX = near(nearest.x);
+  for (const position of state.snapPositions) {
+    const x = near(position.x);
+    if (Math.abs(x - restingX) < Math.abs(nearestX - restingX)) {
+      nearest = position;
+      nearestX = x;
+    }
+  }
+  return period ? { ...nearest, x: nearestX } : nearest;
+}
+
+/**
+ * repeat: x moved (by 4px at most) out of the band around the seam, where a
+ * scroll at rest gets wrapped to the other side (see onRepeat).
+ */
+export function restInLoop(x: number, state: CarouselState): number {
+  const { period, dir } = state;
+  if (period < 8) return x;
+  const pos = (((x * dir) % period) + period) % period;
+  return x + (Math.min(Math.max(pos, 4), period - 4) - pos) * dir;
+}
+
+function hasChanged(position: SnapPosition, state: CarouselState): boolean {
+  // repeat: the same target has a different x on every loop
+  return state.period
+    ? position.target !== state.activeSnapPosition.target
+    : position.x !== state.activeSnapPosition.x;
 }
 
 export function onScrollSnapChange(state: CarouselState): void {
@@ -209,7 +246,7 @@ export function onSnapChanging(
   state: CarouselState,
 ): void {
   const newSnapPosition = snapSelect(target, velocity, friction, state);
-  if (newSnapPosition.x !== state.activeSnapPosition.x) {
+  if (hasChanged(newSnapPosition, state)) {
     state.activeSnapPosition = newSnapPosition;
     dispatchScrollSnapChangingEvent(state.scroller, {
       snapTargetInline: (newSnapPosition || state.activeSnapPosition).target,

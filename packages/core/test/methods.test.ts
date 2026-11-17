@@ -102,3 +102,63 @@ describe("prev", () => {
     expect(scroller.scrollTo).not.toHaveBeenCalled();
   });
 });
+
+describe("with repeat (state.period)", () => {
+  function loopState(scrollLeft: number) {
+    const state = createState();
+    state.scroller = createFakeScroller(scrollLeft);
+    state.period = 400;
+    state.slidePositions = [
+      { x: 92, y: 0, target: null, width: 100, height: 40 },
+      { x: 192, y: 0, target: null, width: 100, height: 40 },
+      { x: 292, y: 0, target: null, width: 100, height: 40 },
+      { x: 392, y: 0, target: null, width: 100, height: 40 },
+    ];
+    return state;
+  }
+
+  it("next past the last slide goes on to the first, one loop on", () => {
+    const state = loopState(392);
+    next(state);
+    expect(state.scroller!.scrollTo).toHaveBeenCalledWith({
+      left: 492,
+      behavior: "smooth",
+    });
+  });
+
+  it("prev before the first slide goes back to the last, one loop back", () => {
+    const state = loopState(92);
+    prev(state);
+    expect(state.scroller!.scrollTo).toHaveBeenCalledWith({
+      left: -8,
+      behavior: "smooth",
+    });
+  });
+
+  it("still prefers a slide within the loop", () => {
+    const state = loopState(192);
+    next(state);
+    prev(state);
+    expect(
+      (state.scroller!.scrollTo as ReturnType<typeof vi.fn>).mock.calls,
+    ).toEqual([
+      [{ left: 292, behavior: "smooth" }],
+      [{ left: 92, behavior: "smooth" }],
+    ]);
+  });
+
+  it("loops snap positions too", () => {
+    const state = loopState(392);
+    state.hasSnap = true;
+    state.snapPositions = state.slidePositions.map(({ x }) => ({
+      target: null,
+      x,
+      y: 0,
+    }));
+    next(state);
+    expect(state.scroller!.scrollTo).toHaveBeenCalledWith({
+      left: 492,
+      behavior: "smooth",
+    });
+  });
+});

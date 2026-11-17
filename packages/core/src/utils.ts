@@ -25,7 +25,8 @@ export function project(
 
 export function resolveCSSLength(parent: Element, value: string): number {
   const num = parseFloat(value);
-  if (!isNaN(num) && !value.includes("calc")) return num;
+  // percentages go through layout below
+  if (!isNaN(num) && !value.includes("calc") && !value.includes("%")) return num;
   if (value === "auto" || value === "normal" || !value) return 0;
   const container = document.createElement("div");
   container.style.position = "absolute";
