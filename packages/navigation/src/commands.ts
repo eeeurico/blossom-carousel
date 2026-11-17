@@ -1,6 +1,6 @@
-import { pageScroll } from "./scroll";
-import { getMarkerTargets } from "./markers";
-import { resolveInlineAlign } from "./snap";
+import { pageScroll, repeatScrollTo } from "./scroll";
+import { getMarkerPositions, getMarkerTargets } from "./markers";
+import { isRepeat, resolveInlineAlign } from "./snap";
 import { getSnapCache } from "./cache";
 
 const COMMAND_NAMESPACE = "--blossom-";
@@ -98,6 +98,14 @@ function runCommand(
     const fresh = cached?.el.isConnected ? cached : undefined;
     const target = fresh?.el ?? getMarkerTargets(scroller)[index];
     if (!target) return;
+
+    // Under repeat the target may be translated to the far side, so
+    // scrollIntoView could go the long way round or stop at the seam: go to
+    // its natural snap position along the loop instead.
+    if (isRepeat(scroller)) {
+      repeatScrollTo(scroller, getMarkerPositions(scroller, [target])[0], behavior);
+      return;
+    }
 
     const inline =
       fresh?.align ?? resolveInlineAlign(getComputedStyle(target).scrollSnapAlign);

@@ -4,7 +4,7 @@ import {
   getMarkerTargets,
 } from "./markers";
 import { canScroll } from "./scroll";
-import { getMarkerSnaps, getSnapPositions, isRtl } from "./snap";
+import { getMarkerSnaps, getSnapPositions, isRtl, repeatPeriod } from "./snap";
 import { clearSnapCache, getSnapCache, setSnapCache } from "./cache";
 import type { NavigationState } from "./types";
 
@@ -36,6 +36,7 @@ function refreshSnapCache(scroller: HTMLElement): void {
     activePositions,
     sortedActivePositions: [...activePositions].sort((a, b) => a - b),
     rtl: isRtl(scroller),
+    period: repeatPeriod(scroller),
   });
 }
 
@@ -84,15 +85,25 @@ function createRegistration(scroller: HTMLElement): ObserverRegistration {
 
   const resizeObserver = new ResizeObserver(onLayoutChange);
   resizeObserver.observe(scroller);
+  // repeat pads the scroller 50% on both sides, which leaves a zero-width
+  // content box: only the border box reports width changes then.
+  const borderBoxObserver = new ResizeObserver(onLayoutChange);
+  borderBoxObserver.observe(scroller, { box: "border-box" });
 
   const mutationObserver = new MutationObserver(onLayoutChange);
-  mutationObserver.observe(scroller, { childList: true, subtree: true });
+  mutationObserver.observe(scroller, {
+    childList: true,
+    subtree: true,
+    // Core switching repeat (looping) on or off changes all of the geometry.
+    attributeFilter: ["has-repeat"],
+  });
 
   const teardown = () => {
     cancelAnimationFrame(frame);
     scroller.removeEventListener("scroll", emit);
     scroller.removeEventListener("scrollend", emit);
     resizeObserver.disconnect();
+    borderBoxObserver.disconnect();
     mutationObserver.disconnect();
     clearSnapCache(scroller);
   };

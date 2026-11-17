@@ -27,6 +27,67 @@ export function logicalScrollLeft(scroller: HTMLElement, rtl: boolean): number {
 }
 
 /**
+ * Resolves a computed `scroll-padding` length to pixels. Unlike margins, its
+ * computed value keeps percentages, which refer to the scrollport.
+ */
+export function resolveScrollPadding(value: string, scrollport: number): number {
+  const length = parseFloat(value) || 0;
+  return value.trim().endsWith("%") ? (length / 100) * scrollport : length;
+}
+
+/**
+ * Whether Blossom's `repeat` (looping) option is active on the scroller. Read
+ * from the attribute core sets, so this package keeps no dependency on it.
+ */
+export function isRepeat(scroller: HTMLElement): boolean {
+  return scroller.getAttribute("has-repeat") === "true";
+}
+
+/** `value` wrapped into `[0, period)`. */
+export function wrap(value: number, period: number): number {
+  return ((value % period) + period) % period;
+}
+
+/**
+ * The logical inline offset `repeat` currently moves `el` by. Near an edge,
+ * core translates slides by one loop to the far side; subtracting this gives
+ * the natural position, which stays put while slides are moved around.
+ */
+function repeatShift(scroller: HTMLElement, el: Element, rtl: boolean): number {
+  let shift = 0;
+  for (let node: Element | null = el; node && node !== scroller; node = node.parentElement) {
+    shift += parseFloat(getComputedStyle(node).translate) || 0;
+  }
+  return rtl ? -shift : shift;
+}
+
+/**
+ * The length of one loop of a `repeat` scroller (scroll positions `s` and
+ * `s ± period` look the same), or 0 without repeat. Measured from the natural
+ * extent of the slides rather than `scrollWidth`, which slides translated to
+ * the far side can inflate.
+ */
+export function repeatPeriod(scroller: HTMLElement): number {
+  if (!isRepeat(scroller)) return 0;
+  let start = Infinity;
+  let end = -Infinity;
+  for (const child of Array.from(scroller.children)) {
+    const styles = getComputedStyle(child);
+    const rect = child.getBoundingClientRect();
+    const shift = parseFloat(styles.translate) || 0;
+    start = Math.min(start, rect.left - shift - (parseFloat(styles.marginLeft) || 0));
+    end = Math.max(end, rect.right - shift + (parseFloat(styles.marginRight) || 0));
+  }
+  if (end <= start) return 0;
+  // The scroll range with every slide in its natural place.
+  const styles = getComputedStyle(scroller);
+  const padding =
+    (parseFloat(styles.paddingInlineStart) || 0) +
+    (parseFloat(styles.paddingInlineEnd) || 0);
+  return end - start + padding - scroller.clientWidth;
+}
+
+/**
  * A snap target paired with its resolved inline alignment — everything needed
  * to bring it into view via `scrollIntoView({ inline })`.
  */
@@ -100,7 +161,11 @@ export function snapPositionFor(
   const startEdge = rtl
     ? scrollerRect.right - rect.right
     : rect.left - scrollerRect.left;
-  const left = startEdge + logicalScrollLeft(scroller, rtl);
+  // Under repeat, use the natural position: slides move by a loop at a time.
+  const left =
+    startEdge +
+    logicalScrollLeft(scroller, rtl) -
+    (isRepeat(scroller) ? repeatShift(scroller, target, rtl) : 0);
   const marginStart = parseFloat(styles.scrollMarginInlineStart) || 0;
   const marginEnd = parseFloat(styles.scrollMarginInlineEnd) || 0;
   const snapAreaStart = left - marginStart;
@@ -142,11 +207,17 @@ export function getSnapPositions(scroller: HTMLElement): SnapPoint[] {
   const scrollerRect = scroller.getBoundingClientRect();
   const scrollerStyles = getComputedStyle(scroller);
   const rtl = scrollerStyles.direction === "rtl";
-  const scrollPaddingStart =
-    parseFloat(scrollerStyles.scrollPaddingInlineStart) || 0;
-  const scrollPaddingEnd =
-    parseFloat(scrollerStyles.scrollPaddingInlineEnd) || 0;
+  const scrollPaddingStart = resolveScrollPadding(
+    scrollerStyles.scrollPaddingInlineStart,
+    scroller.clientWidth,
+  );
+  const scrollPaddingEnd = resolveScrollPadding(
+    scrollerStyles.scrollPaddingInlineEnd,
+    scroller.clientWidth,
+  );
   const maxScroll = Math.max(scroller.scrollWidth - scroller.clientWidth, 0);
+  // repeat has no edges to clamp to: positions are taken modulo the loop.
+  const period = repeatPeriod(scroller);
 
   const walker = document.createTreeWalker(scroller, NodeFilter.SHOW_ELEMENT);
   const points: SnapPoint[] = [];
@@ -168,7 +239,11 @@ export function getSnapPositions(scroller: HTMLElement): SnapPoint[] {
         rtl,
         styles,
       );
-      points.push({ el, align, x: Math.min(Math.max(x, 0), maxScroll) });
+      points.push({
+        el,
+        align,
+        x: period ? wrap(x, period) : Math.min(Math.max(x, 0), maxScroll),
+      });
     }
 
     node = walker.nextNode();

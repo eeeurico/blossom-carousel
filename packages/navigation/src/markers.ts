@@ -2,7 +2,10 @@ import {
   inlineSnapAlign,
   isRtl,
   logicalScrollLeft,
+  repeatPeriod,
+  resolveScrollPadding,
   snapPositionFor,
+  wrap,
 } from "./snap";
 
 /** Attribute the author adds to each element that should get a dot. */
@@ -50,10 +53,14 @@ export function getMarkerPositions(
   const scrollerRect = scroller.getBoundingClientRect();
   const scrollerStyles = getComputedStyle(scroller);
   const rtl = scrollerStyles.direction === "rtl";
-  const scrollPaddingStart =
-    parseFloat(scrollerStyles.scrollPaddingInlineStart) || 0;
-  const scrollPaddingEnd =
-    parseFloat(scrollerStyles.scrollPaddingInlineEnd) || 0;
+  const scrollPaddingStart = resolveScrollPadding(
+    scrollerStyles.scrollPaddingInlineStart,
+    scrollportSize,
+  );
+  const scrollPaddingEnd = resolveScrollPadding(
+    scrollerStyles.scrollPaddingInlineEnd,
+    scrollportSize,
+  );
 
   // The associated target position of each target — its scroll-into-view
   // position, respecting its own `scroll-snap-align`.
@@ -71,6 +78,11 @@ export function getMarkerPositions(
       styles,
     );
   });
+
+  // A repeat scroller has no edges, so no unreachable positions: every one is
+  // taken modulo the loop instead.
+  const period = repeatPeriod(scroller);
+  if (period) return positions.map((p) => wrap(p, period));
 
   // Redistribute unreachable target positions into the edge bands.
   if (scrollRange > 0) {
@@ -168,6 +180,29 @@ export function selectActiveIndex(
 }
 
 /**
+ * {@link selectActiveIndex} for a `repeat` scroller, whose positions lie on a
+ * loop of length `period`: the active target is the one passed most recently
+ * going forward, i.e. the nearest at or cyclically before the current position.
+ * Ties resolve to the earliest target in tree order.
+ */
+export function selectRepeatActiveIndex(
+  positions: number[],
+  position: number,
+  period: number,
+): number {
+  let active = -1;
+  let nearest = Infinity;
+  for (let i = 0; i < positions.length; i++) {
+    const behind = wrap(position + EPSILON - positions[i], period);
+    if (behind < nearest - EPSILON) {
+      nearest = behind;
+      active = i;
+    }
+  }
+  return active;
+}
+
+/**
  * The scroll-invariant geometry needed to resolve the active marker index on
  * the scroll hot loop without layout reads, style reads, or allocations.
  * Subset of the host-maintained `SnapCache`.
@@ -179,6 +214,8 @@ export interface ActiveIndexGeometry {
   sortedActivePositions: number[];
   /** Whether the scroller's inline axis is right-to-left. */
   rtl: boolean;
+  /** Loop length of a `repeat` scroller, 0 without repeat (read live if unset). */
+  period?: number;
 }
 
 /**
@@ -204,6 +241,14 @@ export function getActiveMarkerIndex(
 
   const rtl = cached?.rtl ?? isRtl(scroller);
   const positions = cached?.activePositions ?? getMarkerPositions(scroller, targets);
+  const period = cached?.period ?? repeatPeriod(scroller);
+  if (period) {
+    return selectRepeatActiveIndex(
+      positions,
+      logicalScrollLeft(scroller, rtl),
+      period,
+    );
+  }
   return selectActiveIndex(
     positions,
     logicalScrollLeft(scroller, rtl),

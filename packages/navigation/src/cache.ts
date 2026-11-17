@@ -41,6 +41,11 @@ export interface SnapCache {
    * refresh so the hot loop avoids a `getComputedStyle` per frame.
    */
   rtl: boolean;
+  /**
+   * Loop length of a `repeat` scroller, 0 without repeat. Positions above are
+   * then natural (untranslated) positions taken modulo this.
+   */
+  period?: number;
 }
 
 const store = new WeakMap<HTMLElement, SnapCache>();
